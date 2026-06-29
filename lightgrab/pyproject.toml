@@ -1,0 +1,11 @@
+[project]
+name = "psx2blend-lightgrab"
+version = "0.3.0"
+description = "Grab PSX game scene lighting and use it as a Blender world/HDRI"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "opencv-python>=4.8", "Pillow>=10.0"]
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+psx-lightgrab = "psx_lightgrab:run_gui"

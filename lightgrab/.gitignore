@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+*.hdr
+*.exr
+*_preview.png
+*_blender_setup.py
+*.json
+Screenshots/
