@@ -30,36 +30,49 @@ Tested API paths for Blender 3.x and 4.x/5.x (panorama settings moved from
 cycles per-camera props to camera data in 4.0; both are handled).
 """
 
+import argparse
 import bpy
+import os
 import sys
 import math
 
 # ---------------------------------------------------------------- defaults --
 OBJ_PATH = None          # set to a path, or pass --obj on the command line
-OUT_PATH = "//psx_pano.exr"
+OUT_PATH = None          # resolved in parse_args; None means derive from blend file
 SIZE = 2048              # equirect width; height = SIZE // 2
 EMISSION_GAIN = 1.0      # global multiplier on top of the PS1 2x modulation
 
 
-def parse_args():
+def parse_args() -> None:
+    """Parse CLI args passed after '--' (Blender convention)."""
     global OBJ_PATH, OUT_PATH, SIZE, EMISSION_GAIN
-    if "--" not in sys.argv:
-        return
-    args = sys.argv[sys.argv.index("--") + 1:]
-    it = iter(range(len(args)))
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--obj" and i + 1 < len(args):
-            OBJ_PATH = args[i + 1]; i += 2
-        elif a == "--out" and i + 1 < len(args):
-            OUT_PATH = args[i + 1]; i += 2
-        elif a == "--size" and i + 1 < len(args):
-            SIZE = int(args[i + 1]); i += 2
-        elif a == "--gain" and i + 1 < len(args):
-            EMISSION_GAIN = float(args[i + 1]); i += 2
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    ap = argparse.ArgumentParser(
+        prog="blender_psx_bake.py",
+        description="Render a PSX scene OBJ as an equirectangular EXR")
+    ap.add_argument("--obj", metavar="PATH",
+                    help="OBJ file exported by DuckStation 3D screenshot")
+    ap.add_argument("--out", metavar="PATH", default=None,
+                    help="Output .exr path (default: psx_pano.exr beside the .blend)")
+    ap.add_argument("--size", type=int, default=SIZE,
+                    help="Equirect width in pixels (height = size // 2)")
+    ap.add_argument("--gain", type=float, default=EMISSION_GAIN,
+                    help="Emission multiplier on top of the PS1 2x modulation")
+    args = ap.parse_args(argv)
+
+    OBJ_PATH = args.obj
+    SIZE = args.size
+    EMISSION_GAIN = args.gain
+
+    if args.out is not None:
+        OUT_PATH = os.path.abspath(args.out)
+    else:
+        blend = bpy.data.filepath
+        if blend:
+            OUT_PATH = os.path.join(os.path.dirname(blend), "psx_pano.exr")
         else:
-            i += 1
+            OUT_PATH = os.path.abspath("psx_pano.exr")
+            print(f"[psx_bake] no saved .blend file — writing to {OUT_PATH}")
 
 
 def import_obj(path):

@@ -54,16 +54,19 @@ class Shot:
 @dataclass
 class BuildSettings:
     out_width: int = 2048              # equirect width (height = width // 2)
-    denoise_dither: bool = True        # median+bilateral pass to melt PSX dithering
+    denoise_dither: bool = True        # dither cleanup pass (see dither_mode)
+    dither_mode: str = "bayer"         # "bayer" | "median" | "off"
     feather: float = 0.15              # edge feather fraction for blending overlaps
     hdr_strength: float = 0.6          # 0 = plain linearized LDR, 1 = aggressive inflation
-    sun_boost: float = 4.0             # extra multiplier on the brightest blob (1 = off)
+    sun_boost: float = 4.0             # extra multiplier on bright blobs (1 = off)
+    sun_max_blobs: int = 4             # max distinct light sources to boost independently
     sun_threshold: float = 0.92        # luminance percentile-ish threshold for "sun" pixels
     ambient_fill: bool = True          # fill uncovered regions with blurred ambient
     exposure: float = 1.0              # global gain applied at the end
     auto_crop: bool = True             # detect & remove black border bars (emulator padding)
     hud_color: str = ""                # hex like "#22cc33"; if set, inpaint matching pixels
     hud_tolerance: int = 55            # per-channel tolerance for HUD color match
+    watch_dir: str = ""                # persisted watch-folder path (GUI convenience)
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -121,6 +124,54 @@ def remove_hud(rgb: np.ndarray, hex_color: str, tol: int) -> np.ndarray:
     return cv2.inpaint(rgb, mask, 5, cv2.INPAINT_TELEA)
 
 
+def _denoise_bayer(rgb: np.ndarray) -> np.ndarray:
+    """PSX-aware dither removal.
+
+    The PSX GPU uses a fixed 4x4 ordered Bayer dither at the 5-bit (32-level)
+    quantization boundary. Each 2x2 pixel block has a predictable offset pattern
+    rather than random noise, so a standard median blur overkills fine edges.
+
+    Strategy:
+      1. Detect the 2x2 dither phase by testing four pixel-grid alignments and
+         picking the one whose even-odd pixel difference is largest (the Bayer
+         pattern is strongest along its axis).
+      2. Average each 2x2 cell with the correct phase — this precisely cancels
+         the ordered offset while leaving 1px edges intact.
+      3. A gentle bilateral sharpens contours back up without re-banding.
+
+    Falls back to the original median+bilateral if ximgproc is unavailable.
+    """
+    h, w = rgb.shape[:2]
+    # Phase detection: sample the mean absolute diff between interleaved rows/cols
+    # at each of the four possible 2x2 alignments (dy in {0,1}, dx in {0,1}).
+    best_score, best_dy, best_dx = -1.0, 0, 0
+    for dy in (0, 1):
+        for dx in (0, 1):
+            even_rows = rgb[dy:h - (h - dy) % 2:2, dx:w - (w - dx) % 2:2]
+            odd_rows  = rgb[dy + 1:h - (h - dy) % 2:2, dx:w - (w - dx) % 2:2]
+            min_h = min(even_rows.shape[0], odd_rows.shape[0])
+            if min_h == 0:
+                continue
+            score = float(np.abs(even_rows[:min_h].astype(np.int16)
+                                 - odd_rows[:min_h].astype(np.int16)).mean())
+            if score > best_score:
+                best_score, best_dy, best_dx = score, dy, dx
+
+    # Average each 2x2 block at the detected phase.
+    out = rgb.astype(np.float32)
+    dy, dx = best_dy, best_dx
+    h2 = (h - dy) // 2 * 2
+    w2 = (w - dx) // 2 * 2
+    block = out[dy:dy + h2, dx:dx + w2].reshape(h2 // 2, 2, w2 // 2, 2, 3)
+    avg = block.mean(axis=(1, 3))                        # (h2//2, w2//2, 3)
+    out[dy:dy + h2, dx:dx + w2] = np.repeat(
+        np.repeat(avg, 2, axis=0), 2, axis=1)
+    rgb = np.clip(out, 0, 255).astype(np.uint8)
+
+    # Bilateral to tighten edges that the block-average slightly blurred.
+    return cv2.bilateralFilter(rgb, d=5, sigmaColor=20, sigmaSpace=4)
+
+
 def load_screenshot(path: str, denoise_dither: bool = True,
                     settings: "BuildSettings | None" = None) -> np.ndarray:
     """Load image as float32 RGB [0,1] with optional preprocessing:
@@ -135,10 +186,15 @@ def load_screenshot(path: str, denoise_dither: bool = True,
         if settings.hud_color:
             rgb = remove_hud(rgb, settings.hud_color, settings.hud_tolerance)
     if denoise_dither:
-        # PSX dithering is a 2x2/4x4 ordered pattern; a small median kills the
-        # checkerboard, a gentle bilateral restores edges without re-banding.
-        rgb = cv2.medianBlur(rgb, 3)
-        rgb = cv2.bilateralFilter(rgb, d=5, sigmaColor=24, sigmaSpace=5)
+        mode = settings.dither_mode if settings is not None else "bayer"
+        if mode == "bayer":
+            rgb = _denoise_bayer(rgb)
+        elif mode == "median":
+            # Original approach: small median kills the checkerboard, bilateral
+            # restores edges without re-banding.
+            rgb = cv2.medianBlur(rgb, 3)
+            rgb = cv2.bilateralFilter(rgb, d=5, sigmaColor=24, sigmaSpace=5)
+        # mode == "off": no dither pass
     return (rgb.astype(np.float32) / 255.0)
 
 
@@ -220,16 +276,36 @@ def project_shot(canvas: np.ndarray, weight: np.ndarray, shot: Shot,
     weight += w
 
 
+def _hpad(arr: np.ndarray, pad: int) -> np.ndarray:
+    """Wrap-pad an equirect array horizontally so pyrDown/pyrUp see no hard seam."""
+    return np.concatenate([arr[:, -pad:], arr, arr[:, :pad]], axis=1)
+
+
+def _hcrop(arr: np.ndarray, pad: int) -> np.ndarray:
+    return arr[:, pad:-pad]
+
+
 def pyramid_fill(canvas: np.ndarray, weight: np.ndarray, levels: int = 8) -> np.ndarray:
     """Fill zero-weight regions with progressively blurred covered content.
 
     Push-pull style: downsample (weighted), then on the way back up use real data
     where it exists and the blurred estimate where it doesn't. Gives a smooth
     ambient gradient in the holes instead of black voids.
+
+    The equirect left/right edge maps to yaw=±180 — the same point on the sphere.
+    We wrap-pad before the pyramid so the Gaussian kernels see continuity there,
+    then crop back after. Without this, partial-coverage builds have a visible
+    seam stripe at yaw=180.
     """
     eps = 1e-6
-    imgs = [canvas.copy()]
-    wts = [weight.copy()]
+    W = canvas.shape[1]
+    pad = max(W // 8, 4)
+
+    c_pad = _hpad(canvas, pad)
+    w_pad = _hpad(weight[..., None], pad)[..., 0]
+
+    imgs = [c_pad]
+    wts = [w_pad]
     for _ in range(levels):
         c = cv2.pyrDown(imgs[-1])
         w = cv2.pyrDown(wts[-1])
@@ -250,7 +326,11 @@ def pyramid_fill(canvas: np.ndarray, weight: np.ndarray, levels: int = 8) -> np.
         real = imgs[lvl] / np.maximum(wts[lvl], eps)[..., None]
         a = np.clip(wts[lvl], 0, 1)[..., None]
         filled = real * a + up * (1 - a)
-    return filled.astype(np.float32)
+
+    # Remove the horizontal wrap-padding.
+    scale = filled.shape[1] / c_pad.shape[1]
+    crop = max(int(round(pad * scale)), 1)
+    return _hcrop(filled, crop).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -258,13 +338,16 @@ def pyramid_fill(canvas: np.ndarray, weight: np.ndarray, levels: int = 8) -> np.
 # --------------------------------------------------------------------------- #
 
 def pseudo_hdr(linear_img: np.ndarray, strength: float, sun_boost: float,
-               sun_threshold: float, exposure: float) -> np.ndarray:
+               sun_threshold: float, exposure: float,
+               sun_max_blobs: int = 4) -> np.ndarray:
     """Fabricate dynamic range from an LDR (linearized) image.
 
     - Inverse Reinhard inflation: L' = L / (1 - k*L). Bright pixels shoot up,
       midtones barely move, so the map gains lighting punch without going gray.
-    - Sun pass: the brightest connected blob (sky disk, lamp flare, fog glow)
-      gets an extra multiplier with a soft falloff so Blender gets a key light.
+    - Sun pass: distinct bright blobs (campfire, lamp, sky disk, fog glow) each
+      get their own boosted Gaussian so Blender sees multiple independent light
+      sources rather than one merged blob. Up to sun_max_blobs are processed,
+      sorted by area (largest first).
     """
     img = np.clip(linear_img, 0.0, 1.0)
     k = np.clip(strength, 0.0, 0.97)
@@ -273,12 +356,30 @@ def pseudo_hdr(linear_img: np.ndarray, strength: float, sun_boost: float,
     if sun_boost > 1.0:
         lum = luminance(img)
         thr = max(float(np.quantile(lum, sun_threshold)), 0.5)
-        mask = (lum >= thr).astype(np.float32)
-        if mask.any():
-            sigma = max(linear_img.shape[1] // 256, 3)
-            soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
-            soft = np.clip(soft / max(soft.max(), 1e-6), 0, 1)
-            inflated *= (1.0 + (sun_boost - 1.0) * soft)[..., None]
+        binary = (lum >= thr).astype(np.uint8)
+        if binary.any():
+            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                binary, connectivity=8)
+            # stats columns: LEFT, TOP, WIDTH, HEIGHT, AREA; label 0 is background
+            blob_labels = sorted(range(1, n_labels),
+                                 key=lambda i: stats[i, cv2.CC_STAT_AREA],
+                                 reverse=True)
+            blob_labels = blob_labels[:max(sun_max_blobs, 1)]
+
+            sigma_base = max(linear_img.shape[1] // 256, 3)
+            combined_soft = np.zeros(lum.shape, dtype=np.float32)
+            for lbl in blob_labels:
+                blob_mask = (labels == lbl).astype(np.float32)
+                w = stats[lbl, cv2.CC_STAT_WIDTH]
+                h = stats[lbl, cv2.CC_STAT_HEIGHT]
+                sigma = max(int(max(w, h) * 0.4), sigma_base)
+                soft = cv2.GaussianBlur(blob_mask, (0, 0),
+                                        sigmaX=sigma, sigmaY=sigma)
+                combined_soft = np.maximum(combined_soft, soft)
+
+            combined_soft = np.clip(
+                combined_soft / max(combined_soft.max(), 1e-6), 0, 1)
+            inflated *= (1.0 + (sun_boost - 1.0) * combined_soft)[..., None]
 
     return (inflated * exposure).astype(np.float32)
 
@@ -345,7 +446,8 @@ def build_panorama(shots: list[Shot], settings: BuildSettings,
     if progress:
         progress("Inflating to pseudo-HDR")
     hdr = pseudo_hdr(filled, settings.hdr_strength, settings.sun_boost,
-                     settings.sun_threshold, settings.exposure)
+                     settings.sun_threshold, settings.exposure,
+                     settings.sun_max_blobs)
     return hdr
 
 
@@ -354,7 +456,8 @@ def build_gradient(shot_path: str, settings: BuildSettings) -> np.ndarray:
     img = srgb_to_linear(img)
     env = gradient_environment(img, settings.out_width)
     return pseudo_hdr(env, settings.hdr_strength, settings.sun_boost,
-                      settings.sun_threshold, settings.exposure)
+                      settings.sun_threshold, settings.exposure,
+                      settings.sun_max_blobs)
 
 
 def save_hdr(hdr_rgb: np.ndarray, path: str) -> None:
@@ -451,5 +554,6 @@ def boost_existing(path_in: str, settings: BuildSettings) -> np.ndarray:
     peak = max(float(rgb.max()), 1e-6)
     norm = np.clip(rgb / max(peak, 1.0), 0, 1)
     out = pseudo_hdr(norm, settings.hdr_strength, settings.sun_boost,
-                     settings.sun_threshold, settings.exposure)
+                     settings.sun_threshold, settings.exposure,
+                     settings.sun_max_blobs)
     return out * max(peak, 1.0)

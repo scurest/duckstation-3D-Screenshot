@@ -222,13 +222,17 @@ def run_gui():
             self.var_sun = tk.DoubleVar(value=self.settings.sun_boost)
             self.var_exp = tk.DoubleVar(value=self.settings.exposure)
             self.var_dither = tk.BooleanVar(value=self.settings.denoise_dither)
+            self.var_dither_mode = tk.StringVar(value=self.settings.dither_mode)
 
             row = ttk.Frame(st); row.pack(fill="x")
             ttk.Label(row, text="Width").pack(side="left")
             ttk.Combobox(row, textvariable=self.var_width, width=6,
                          values=[1024, 2048, 4096]).pack(side="left", padx=4)
-            ttk.Checkbutton(row, text="De-dither (PSX checkerboard cleanup)",
+            ttk.Checkbutton(row, text="De-dither",
                             variable=self.var_dither).pack(side="left", padx=10)
+            ttk.Combobox(row, textvariable=self.var_dither_mode, width=7,
+                         values=["bayer", "median", "off"],
+                         state="readonly").pack(side="left")
 
             self.var_crop = tk.BooleanVar(value=self.settings.auto_crop)
             self.var_hud = tk.StringVar(value=self.settings.hud_color)
@@ -409,9 +413,11 @@ def run_gui():
             self.settings.sun_boost = float(self.var_sun.get())
             self.settings.exposure = float(self.var_exp.get())
             self.settings.denoise_dither = bool(self.var_dither.get())
+            self.settings.dither_mode = self.var_dither_mode.get()
             self.settings.auto_crop = bool(self.var_crop.get())
             hud = self.var_hud.get().strip()
             self.settings.hud_color = hud if len(hud.lstrip("#")) == 6 else ""
+            self.settings.watch_dir = self.watch_dir or ""
             return self.settings
 
         def build(self):
@@ -499,8 +505,13 @@ def run_gui():
             self.var_sun.set(self.settings.sun_boost)
             self.var_exp.set(self.settings.exposure)
             self.var_dither.set(self.settings.denoise_dither)
+            self.var_dither_mode.set(self.settings.dither_mode)
             self.var_crop.set(self.settings.auto_crop)
             self.var_hud.set(self.settings.hud_color)
+            if self.settings.watch_dir and os.path.isdir(self.settings.watch_dir):
+                self.watch_dir = self.settings.watch_dir
+                self._seen = set(self._all_in_watch())
+                self.watch_lbl.config(text=f"Watching: {self.watch_dir}")
             self.refresh_list()
             self.status.set(f"Project loaded: {os.path.basename(p)}")
 
