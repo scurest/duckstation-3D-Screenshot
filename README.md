@@ -1,6 +1,26 @@
 # DuckStation - PlayStation 1, aka. PSX Emulator
 [Features](#features) | [Downloading and Running](#downloading-and-running) | [Building](#building) | [Disclaimers](#disclaimers)
 
+---
+
+## psx2blend — PSX scene lighting for Blender
+
+This is the **psx2blend** fork, tracking scurest's `feature/3d-screenshot`
+branch. It adds a freecam and OBJ export to DuckStation so you can pull real
+PSX scene geometry and lighting into Blender as a world/HDRI.
+
+**Capture (this fork):** enable PGXP Geometry Correction → freecam → 3D
+screenshot → OBJ/MTL + textures dumped to disk.
+
+**Post-process ([`lightgrab/`](lightgrab/README.md)):** a Python tool that
+stitches captures into a pseudo-HDR equirectangular map and generates a
+ready-to-run Blender World setup script. Works on plain 2D screenshots too.
+
+> The emulator core, renderer, and game-compatibility paths are unchanged
+> from upstream. Only the freecam and 3D-screenshot subsystems are new.
+
+---
+
 **Latest Builds for Windows 10/11, Linux (AppImage/Flatpak), and macOS:** https://github.com/stenzek/duckstation/releases/tag/latest
 
 **Game Compatibility List:** https://docs.google.com/spreadsheets/d/1H66MxViRjjE5f8hOl5RQmF5woS1murio2dsLn14kEqo/edit
